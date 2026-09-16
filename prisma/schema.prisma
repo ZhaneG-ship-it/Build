@@ -1,0 +1,947 @@
+// Clarity — AI Business Intelligence & Implementation Platform
+// Tenancy model: every business-owned row carries `organisationId`.
+// All data access goes through lib/tenancy.ts which forces that scope.
+//
+// Provider is SQLite for zero-config local/dev running. The schema deliberately
+// avoids Postgres-only features so `provider = "postgresql"` is a one-line swap
+// for production (see docs/ARCHITECTURE.md § Database portability).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Identity & tenancy
+// ---------------------------------------------------------------------------
+
+model User {
+  id           String    @id @default(cuid())
+  email        String    @unique
+  name         String
+  passwordHash String
+  // Global platform role. Org-level roles live on Membership.
+  platformRole String    @default("USER") // USER | PLATFORM_ADMIN
+  jobTitle     String?
+  isActive     Boolean   @default(true)
+  lastLoginAt  DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  memberships   Membership[]
+  sessions      Session[]
+  auditLogs     AuditLog[]
+  ownedTasks    Task[]             @relation("TaskAssignee")
+  comments      Comment[]
+  answeredItems AssessmentAnswer[]
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  token     String   @unique
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt DateTime
+  userAgent String?
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+}
+
+model Organisation {
+  id        String       @id @default(cuid())
+  name      String
+  slug      String       @unique
+  status    String       @default("ACTIVE") // ACTIVE | SUSPENDED
+  planId    String?
+  plan      PricingPlan? @relation(fields: [planId], references: [id])
+  createdAt DateTime     @default(now())
+  updatedAt DateTime     @updatedAt
+
+  memberships       Membership[]
+  businessProfiles  BusinessProfile[]
+  departments       Department[]
+  employees         Employee[]
+  assessments       Assessment[]
+  documents         Document[]
+  documentChunks    DocumentChunk[]
+  processes         Process[]
+  systems           BusinessSystem[]
+  integrations      Integration[]
+  problems          Problem[]
+  objectives        Objective[]
+  opportunities     AIOpportunity[]
+  reports           Report[]
+  roadmaps          Roadmap[]
+  projects          Project[]
+  kpis              Kpi[]
+  implementations   AIImplementation[]
+  reviews           AIReview[]
+  auditLogs         AuditLog[]
+  knowledgeVersions KnowledgeModelVersion[]
+  interviewSessions InterviewSession[]
+  discoveryCycles   DiscoveryCycle[]
+}
+
+/// Links a user to an organisation with a role. A consultant is linked to every
+/// client organisation they serve; a platform admin needs no membership.
+model Membership {
+  id             String   @id @default(cuid())
+  userId         String
+  organisationId String
+  role           String // OWNER | EMPLOYEE | CONSULTANT
+  departmentId   String?
+  invitedBy      String?
+  createdAt      DateTime @default(now())
+
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  organisation Organisation @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  department   Department?  @relation(fields: [departmentId], references: [id])
+
+  @@unique([userId, organisationId])
+  @@index([organisationId])
+}
+
+model PricingPlan {
+  id            String         @id @default(cuid())
+  name          String         @unique
+  monthlyPrice  Int            @default(0)
+  currency      String         @default("GBP")
+  maxUsers      Int            @default(10)
+  maxDocuments  Int            @default(100)
+  features      String         @default("[]") // JSON array
+  isActive      Boolean        @default(true)
+  organisations Organisation[]
+}
+
+// ---------------------------------------------------------------------------
+// Business profile / knowledge model
+// ---------------------------------------------------------------------------
+
+model BusinessProfile {
+  id             String       @id @default(cuid())
+  organisationId String
+  organisation   Organisation @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+
+  version   Int     @default(1)
+  isCurrent Boolean @default(true)
+
+  // Company
+  legalName        String?
+  industry         String?
+  subIndustry      String?
+  companySize      String? // 1-9 | 10-49 | 50-249 | 250-999 | 1000+
+  employeeCount    Int?
+  locations        String  @default("[]") // JSON array of strings
+  website          String?
+  businessModel    String? // B2B | B2C | B2B2C | MARKETPLACE | OTHER
+  productsServices String?
+  targetCustomers  String?
+  annualTurnover   Float?
+  currency         String  @default("GBP")
+
+  // Strategy
+  biggestGoals     String?
+  biggestProblems  String?
+  growthLimiters   String?
+  inefficientAreas String?
+  timeSinks        String?
+  errorAreas       String?
+  delayAreas       String?
+  aiAmbition       String?
+
+  // Financial baselines used by the outcome engine
+  avgHourlyLabourCost Float?
+  avgSalary           Float?
+  avgCustomerValue    Float?
+  monthlyLeadVolume   Int?
+  conversionRate      Float?
+  operatingCosts      Float?
+  aiBudget            Float?
+
+  // Risk posture
+  handlesSensitiveData Boolean @default(false)
+  regulations          String  @default("[]") // JSON array
+  securityConcerns     String?
+  noAutonomyProcesses  String?
+
+  // AI posture
+  currentAiUsage      String?
+  aiTools             String  @default("[]") // JSON array
+  aiMaturityLevel     Int     @default(0) // 0-5
+  automationAppetite  String? // LOW | MEDIUM | HIGH
+  oversightPreference String? // HUMAN_IN_LOOP | HUMAN_ON_LOOP | AUTONOMOUS
+
+  completeness Float    @default(0) // 0-1, drives the adaptive interview
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@index([organisationId])
+}
+
+/// Immutable snapshot of the whole knowledge model, so the platform can show
+/// "Business Profile v1 -> v2 -> v3" over time (§16).
+model KnowledgeModelVersion {
+  id             String       @id @default(cuid())
+  organisationId String
+  organisation   Organisation @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  version        Int
+  snapshot       String // JSON of the full knowledge model
+  changeSummary  String?
+  triggeredBy    String? // ASSESSMENT | INTERVIEW | DOCUMENT | MANUAL | DISCOVERY
+  createdAt      DateTime     @default(now())
+
+  @@unique([organisationId, version])
+  @@index([organisationId])
+}
+
+model Department {
+  id             String       @id @default(cuid())
+  organisationId String
+  organisation   Organisation @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  name           String
+  headcount      Int?
+  function       String?
+  managerName    String?
+  annualCost     Float?
+  notes          String?
+  source         String       @default("MANUAL") // MANUAL | ASSESSMENT | DOCUMENT | AI
+  createdAt      DateTime     @default(now())
+
+  employees   Employee[]
+  processes   Process[]
+  memberships Membership[]
+  problems    Problem[]
+
+  @@index([organisationId])
+}
+
+model Employee {
+  id                     String       @id @default(cuid())
+  organisationId         String
+  organisation           Organisation @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  departmentId           String?
+  department             Department?  @relation(fields: [departmentId], references: [id])
+  name                   String
+  role                   String?
+  hourlyCost             Float?
+  repetitiveHoursPerWeek Float?
+  aiLiteracy             String? // NONE | BASIC | CONFIDENT | ADVANCED
+  trainingNeeds          String?
+  createdAt              DateTime     @default(now())
+
+  @@index([organisationId])
+}
+
+// ---------------------------------------------------------------------------
+// Assessment & adaptive interview
+// ---------------------------------------------------------------------------
+
+model AssessmentTemplate {
+  id          String   @id @default(cuid())
+  key         String   @unique
+  name        String
+  description String?
+  industry    String? // null = applies to all industries
+  version     Int      @default(1)
+  isActive    Boolean  @default(true)
+  definition  String // JSON: sections -> questions
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model Assessment {
+  id             String       @id @default(cuid())
+  organisationId String
+  organisation   Organisation @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  templateKey    String       @default("core-ai-readiness")
+  name           String
+  status         String       @default("IN_PROGRESS") // NOT_STARTED | IN_PROGRESS | COMPLETE
+  assignedToId   String?
+  progress       Float        @default(0)
+  completedAt    DateTime?
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  questions AssessmentQuestion[]
+  answers   AssessmentAnswer[]
+
+  @@index([organisationId])
+}
+
+model AssessmentQuestion {
+  id                String     @id @default(cuid())
+  assessmentId      String
+  assessment        Assessment @relation(fields: [assessmentId], references: [id], onDelete: Cascade)
+  section           String
+  businessArea      String
+  key               String
+  prompt            String
+  helpText          String?
+  inputType         String // TEXT | LONGTEXT | NUMBER | CURRENCY | PERCENT | SELECT | MULTISELECT | BOOLEAN | SCALE
+  options           String     @default("[]") // JSON array
+  required          Boolean    @default(false)
+  order             Int        @default(0)
+  // Adaptive questions carry the reason they were asked (§7)
+  isAdaptive        Boolean    @default(false)
+  reasonForQuestion String?
+  dependsOn         String? // JSON rule: {questionKey, equals|includes|gt}
+
+  answers AssessmentAnswer[]
+
+  @@index([assessmentId])
+}
+
+model AssessmentAnswer {
+  id           String             @id @default(cuid())
+  assessmentId String
+  assessment   Assessment         @relation(fields: [assessmentId], references: [id], onDelete: Cascade)
+  questionId   String
+  question     AssessmentQuestion @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  questionKey  String
+  value        String // JSON-encoded value
+  answeredById String?
+  answeredBy   User?              @relation(fields: [answeredById], references: [id])
+  confidence   String             @default("HIGH") // HIGH | MEDIUM | LOW
+  source       String             @default("USER") // USER | DOCUMENT | AI_INFERRED | INTEGRATION
+  sourceRef    String?
+  createdAt    DateTime           @default(now())
+  updatedAt    DateTime           @updatedAt
+
+  @@unique([assessmentId, questionId])
+  @@index([assessmentId])
+}
+
+/// An adaptive AI interview run (§7). Questions are generated from gaps in the
+/// knowledge model; every question stores why it was asked.
+model InterviewSession {
+  id             String       @id @default(cuid())
+  organisationId String
+  organisation   Organisation @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  status         String       @default("ACTIVE") // ACTIVE | SUFFICIENT | CLOSED
+  focusArea      String?
+  roundsRun      Int          @default(0)
+  stopReason     String?
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  turns InterviewTurn[]
+
+  @@index([organisationId])
+}
+
+model InterviewTurn {
+  id                String           @id @default(cuid())
+  sessionId         String
+  session           InterviewSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  question          String
+  answer            String?
+  reasonForQuestion String
+  businessArea      String
+  targetField       String? // knowledge-model field this fills
+  inputType         String           @default("LONGTEXT")
+  options           String           @default("[]")
+  source            String           @default("AI")
+  confidence        String           @default("MEDIUM")
+  round             Int              @default(1)
+  order             Int              @default(0)
+  answeredAt        DateTime?
+  createdAt         DateTime         @default(now())
+
+  @@index([sessionId])
+}
+
+// ---------------------------------------------------------------------------
+// Document intelligence
+// ---------------------------------------------------------------------------
+
+model Document {
+  id                       String       @id @default(cuid())
+  organisationId           String
+  organisation             Organisation @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  fileName                 String
+  mimeType                 String
+  sizeBytes                Int
+  storagePath              String
+  classification           String       @default("UNCLASSIFIED") // SOP | HANDBOOK | PROCESS_DOC | SPREADSHEET | REPORT | ORG_CHART | CONTRACT | PRODUCT_INFO | FAQ | MARKETING | SALES_SCRIPT | JOB_DESCRIPTION | POLICY | TRAINING | UNCLASSIFIED
+  classificationConfidence String       @default("MEDIUM")
+  status                   String       @default("PENDING") // PENDING | PROCESSING | PROCESSED | FAILED
+  extractedText            String?
+  summary                  String?
+  wordCount                Int          @default(0)
+  entities                 String       @default("[]") // JSON: [{type,value,context}]
+  facts                    String       @default("[]") // JSON: [{field,value,confidence}]
+  error                    String?
+  uploadedById             String?
+  createdAt                DateTime     @default(now())
+  processedAt              DateTime?
+
+  chunks DocumentChunk[]
+
+  @@index([organisationId])
+}
+
+model DocumentChunk {
+  id             String       @id @default(cuid())
+  organisationId String
+  organisation   Organisation @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  documentId     String
+  document       Document     @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  chunkIndex     Int
+  content        String
+  tokenEstimate  Int          @default(0)
+  embedding      String // JSON array of floats
+  embeddingModel String       @default("local-hashed-tfidf-v1")
+  createdAt      DateTime     @default(now())
+
+  @@index([organisationId])
+  @@index([documentId])
+}
+
+// ---------------------------------------------------------------------------
+// Processes
+// ---------------------------------------------------------------------------
+
+model Process {
+  id             String       @id @default(cuid())
+  organisationId String
+  organisation   Organisation @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  departmentId   String?
+  department     Department?  @relation(fields: [departmentId], references: [id])
+
+  name                String
+  description         String?
+  owner               String?
+  trigger             String?
+  employeesInvolved   Int?
+  systemsUsed         String   @default("[]") // JSON array of system names
+  inputs              String?
+  outputs             String?
+  frequency           String? // CONTINUOUS | DAILY | WEEKLY | MONTHLY | QUARTERLY | ANNUAL | AD_HOC
+  volumePerPeriod     Float?
+  avgDurationMins     Float?
+  hoursPerWeek        Float?
+  costPerYear         Float?
+  errorRate           Float?
+  errorImpact         String?
+  delayDescription    String?
+  customerImpact      String? // NONE | LOW | MEDIUM | HIGH
+  revenueImpact       String? // NONE | LOW | MEDIUM | HIGH
+  manualScore         Int? // 1-5 how manual
+  repetitivenessScore Int? // 1-5
+  dataReadiness       Int? // 1-5
+  aiPotential         Int? // 0-100 computed
+  automationPotential Int? // 0-100 computed
+  riskLevel           String   @default("LOW") // LOW | MEDIUM | HIGH
+  source              String   @default("ASSESSMENT") // ASSESSMENT | DOCUMENT | INTERVIEW | MANUAL | AI
+  sourceRef           String?
+  confidence          String   @default("MEDIUM")
+  editedByConsultant  Boolean  @default(false)
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  steps         ProcessStep[]
+  problems      Problem[]
+  opportunities AIOpportunity[]
+
+  @@index([organisationId])
+}
+
+model ProcessStep {
+  id           String  @id @default(cuid())
+  processId    String
+  process      Process @relation(fields: [processId], references: [id], onDelete: Cascade)
+  order        Int
+  name         String
+  description  String?
+  role         String?
+  systemUsed   String?
+  durationMins Float?
+  isManual     Boolean @default(true)
+  isBottleneck Boolean @default(false)
+  automatable  Boolean @default(false)
+  notes        String?
+
+  @@index([processId])
+}
+
+model BusinessSystem {
+  id             String       @id @default(cuid())
+  organisationId String
+  organisation   Organisation @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  name           String
+  category       String // CRM | ERP | ACCOUNTING | HR | EMAIL | STORAGE | PROJECT_MGMT | ECOMMERCE | WEBSITE | INDUSTRY | SPREADSHEET | OTHER
+  vendor         String?
+  usageNotes     String?
+  hasApi         Boolean      @default(false)
+  dataQuality    Int? // 1-5
+  source         String       @default("ASSESSMENT")
+  createdAt      DateTime     @default(now())
+
+  @@index([organisationId])
+}
+
+/// Registry of external business-system connectors (§26 forward-compatibility).
+/// Connector definitions live in lib/integrations/registry.ts.
+model Integration {
+  id             String       @id @default(cuid())
+  organisationId String
+  organisation   Organisation @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  provider       String // e.g. HUBSPOT | XERO | MS365 | GOOGLE_WORKSPACE | SLACK
+  status         String       @default("AVAILABLE") // AVAILABLE | CONNECTED | ERROR | COMING_SOON
+  config         String       @default("{}")
+  lastSyncAt     DateTime?
+  createdAt      DateTime     @default(now())
+
+  @@index([organisationId])
+}
+
+// ---------------------------------------------------------------------------
+// Problems & objectives
+// ---------------------------------------------------------------------------
+
+model Problem {
+  id             String       @id @default(cuid())
+  organisationId String
+  organisation   Organisation @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  processId      String?
+  process        Process?     @relation(fields: [processId], references: [id])
+  departmentId   String?
+  department     Department?  @relation(fields: [departmentId], references: [id])
+
+  title              String
+  description        String?
+  category           String // BOTTLENECK | COST | ERROR | DELAY | CAPACITY | QUALITY | VISIBILITY
+  severity           String   @default("MEDIUM") // LOW | MEDIUM | HIGH | CRITICAL
+  rootCause          String?
+  annualCostEstimate Float?
+  hoursLostPerWeek   Float?
+  evidence           String   @default("[]") // JSON: [{type,ref,quote}]
+  source             String   @default("ASSESSMENT")
+  confidence         String   @default("MEDIUM")
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  opportunities AIOpportunity[]
+
+  @@index([organisationId])
+}
+
+model Objective {
+  id             String       @id @default(cuid())
+  organisationId String
+  organisation   Organisation @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  title          String
+  category       String // REVENUE | COST | GROWTH | PRODUCTIVITY | CUSTOMER_EXPERIENCE | QUALITY | RISK
+  description    String?
+  targetValue    String?
+  horizon        String? // SHORT | MEDIUM | LONG
+  priority       Int          @default(3) // 1 highest
+  source         String       @default("ASSESSMENT")
+  createdAt      DateTime     @default(now())
+
+  @@index([organisationId])
+}
+
+// ---------------------------------------------------------------------------
+// Opportunity engine
+// ---------------------------------------------------------------------------
+
+model AIOpportunity {
+  id             String       @id @default(cuid())
+  organisationId String
+  organisation   Organisation @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  processId      String?
+  process        Process?     @relation(fields: [processId], references: [id])
+  problemId      String?
+  problem        Problem?     @relation(fields: [problemId], references: [id])
+
+  name             String
+  currentProblem   String
+  proposedSolution String
+  aiCategory       String // GENERATIVE_AI | AI_ASSISTANT | AI_AGENT | WORKFLOW_AUTOMATION | DOCUMENT_AI | PREDICTIVE_ANALYTICS | VOICE_AI | COMPUTER_VISION | KNOWLEDGE_MANAGEMENT | AI_CHATBOT | AI_REPORTING | AI_FORECASTING | NOT_RECOMMENDED
+  rationale        String?
+
+  // The engine may conclude AI is not appropriate (§11)
+  recommendation       String  @default("INVESTIGATE") // IMPLEMENT | INVESTIGATE | DEFER | NOT_RECOMMENDED | DO_NOTHING
+  notRecommendedReason String?
+
+  implementationComplexity String @default("MEDIUM") // LOW | MEDIUM | HIGH
+  riskLevel                String @default("MEDIUM") // LOW | MEDIUM | HIGH
+  humanOversight           String @default("HUMAN_IN_LOOP") // HUMAN_IN_LOOP | HUMAN_ON_LOOP | PERIODIC_AUDIT | AUTONOMOUS
+  dependencies             String @default("{}") // JSON {data,software,apis,integrations,training,security,policies}
+
+  priorityScore      Float  @default(0)
+  priorityBand       String @default("PHASE_2") // PHASE_1 | PHASE_2 | PHASE_3 | NOT_RECOMMENDED
+  confidence         String @default("MEDIUM")
+  missingInformation String @default("[]") // JSON array of strings
+
+  status             String  @default("DRAFT") // DRAFT | CONSULTANT_REVIEW | APPROVED_BY_CONSULTANT | SENT_TO_CLIENT | CLIENT_APPROVED | CLIENT_REJECTED | IN_IMPLEMENTATION | LIVE
+  editedByConsultant Boolean @default(false)
+  consultantNotes    String?
+  clientDecisionNote String?
+  generatedBy        String  @default("engine") // engine | llm | consultant
+  sources            String  @default("[]") // JSON: [{type,ref,detail}]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  calculation    OpportunityCalculation?
+  kpis           Kpi[]
+  projects       Project[]
+  roadmapItems   RoadmapItem[]
+  implementation AIImplementation?
+
+  @@index([organisationId])
+}
+
+/// Every number the platform shows is reproducible from this row: inputs,
+/// assumptions, formula and range (§10, §19).
+model OpportunityCalculation {
+  id            String        @id @default(cuid())
+  opportunityId String        @unique
+  opportunity   AIOpportunity @relation(fields: [opportunityId], references: [id], onDelete: Cascade)
+
+  currentHoursPerYear Float?
+  currentAnnualCost   Float?
+
+  reductionLowPct         Float?
+  reductionHighPct        Float?
+  capacityReleasedLowHrs  Float?
+  capacityReleasedHighHrs Float?
+
+  costSavingLow          Float?
+  costSavingHigh         Float?
+  revenueOpportunityLow  Float?
+  revenueOpportunityHigh Float?
+
+  implementationCostLow  Float?
+  implementationCostHigh Float?
+  runningCostPerYear     Float?
+
+  paybackMonthsLow  Float?
+  paybackMonthsHigh Float?
+
+  currency       String   @default("GBP")
+  assumptions    String   @default("[]") // JSON: [{label,value,source,isEstimate}]
+  formulas       String   @default("[]") // JSON: [{label,expression,result}]
+  inputs         String   @default("{}") // JSON snapshot of inputs used
+  benchmarksUsed String   @default("[]")
+  confidence     String   @default("MEDIUM")
+  missingInputs  String   @default("[]")
+  calculatedAt   DateTime @default(now())
+}
+
+// ---------------------------------------------------------------------------
+// Reports & roadmap
+// ---------------------------------------------------------------------------
+
+model Report {
+  id              String       @id @default(cuid())
+  organisationId  String
+  organisation    Organisation @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  type            String       @default("AI_OPPORTUNITY") // AI_OPPORTUNITY | PERFORMANCE | DISCOVERY
+  title           String
+  version         Int          @default(1)
+  status          String       @default("DRAFT") // DRAFT | CONSULTANT_REVIEW | APPROVED | PUBLISHED
+  content         String // JSON document tree
+  summary         String?
+  generatedBy     String       @default("engine")
+  approvedById    String?
+  approvedAt      DateTime?
+  publishedAt     DateTime?
+  consultantEdits String       @default("{}") // JSON: sectionKey -> replacement text
+  createdAt       DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
+
+  @@index([organisationId])
+}
+
+model Roadmap {
+  id             String       @id @default(cuid())
+  organisationId String
+  organisation   Organisation @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  title          String       @default("AI Roadmap")
+  version        Int          @default(1)
+  status         String       @default("DRAFT") // DRAFT | APPROVED | ACTIVE
+  notes          String?
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  items RoadmapItem[]
+
+  @@index([organisationId])
+}
+
+model RoadmapItem {
+  id             String        @id @default(cuid())
+  roadmapId      String
+  roadmap        Roadmap       @relation(fields: [roadmapId], references: [id], onDelete: Cascade)
+  opportunityId  String
+  opportunity    AIOpportunity @relation(fields: [opportunityId], references: [id], onDelete: Cascade)
+  phase          String // PHASE_1 | PHASE_2 | PHASE_3
+  sequence       Int           @default(0)
+  targetQuarter  String?
+  rationale      String?
+  clientDecision String        @default("PENDING") // PENDING | APPROVED | REJECTED | DEFERRED
+  decidedAt      DateTime?
+  decidedById    String?
+
+  @@index([roadmapId])
+}
+
+// ---------------------------------------------------------------------------
+// Implementation
+// ---------------------------------------------------------------------------
+
+model Project {
+  id             String         @id @default(cuid())
+  organisationId String
+  organisation   Organisation   @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  opportunityId  String?
+  opportunity    AIOpportunity? @relation(fields: [opportunityId], references: [id])
+
+  name                   String
+  objective              String?
+  scope                  String?
+  ownerUserId            String?
+  aiTechnology           String?
+  integrations           String    @default("[]")
+  dataRequirements       String?
+  securityRequirements   String?
+  testingRequirements    String?
+  launchRequirements     String?
+  trainingRequirements   String?
+  humanOversight         String?
+  monitoringRequirements String?
+  stage                  String    @default("DISCOVERY") // DISCOVERY | REQUIREMENTS | DESIGN | BUILD | TESTING | PILOT | LAUNCH | MONITORING | OPTIMISATION
+  status                 String    @default("ACTIVE") // ACTIVE | ON_HOLD | COMPLETE | CANCELLED
+  health                 String    @default("ON_TRACK") // ON_TRACK | AT_RISK | OFF_TRACK
+  budget                 Float?
+  spend                  Float?
+  startDate              DateTime?
+  targetDate             DateTime?
+  createdAt              DateTime  @default(now())
+  updatedAt              DateTime  @updatedAt
+
+  tasks      Task[]
+  milestones Milestone[]
+  comments   Comment[]
+  kpis       Kpi[]
+  files      ProjectFile[]
+
+  @@index([organisationId])
+}
+
+model Milestone {
+  id          String    @id @default(cuid())
+  projectId   String
+  project     Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  name        String
+  stage       String
+  dueDate     DateTime?
+  completedAt DateTime?
+  order       Int       @default(0)
+
+  @@index([projectId])
+}
+
+model Task {
+  id          String    @id @default(cuid())
+  projectId   String
+  project     Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  title       String
+  description String?
+  stage       String    @default("DISCOVERY")
+  status      String    @default("TODO") // TODO | IN_PROGRESS | BLOCKED | DONE
+  priority    String    @default("MEDIUM")
+  assigneeId  String?
+  assignee    User?     @relation("TaskAssignee", fields: [assigneeId], references: [id])
+  dueDate     DateTime?
+  completedAt DateTime?
+  order       Int       @default(0)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([projectId])
+}
+
+model ProjectFile {
+  id           String   @id @default(cuid())
+  projectId    String
+  project      Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  fileName     String
+  storagePath  String
+  sizeBytes    Int
+  mimeType     String
+  uploadedById String?
+  createdAt    DateTime @default(now())
+
+  @@index([projectId])
+}
+
+model Comment {
+  id        String   @id @default(cuid())
+  projectId String
+  project   Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  authorId  String
+  author    User     @relation(fields: [authorId], references: [id])
+  body      String
+  createdAt DateTime @default(now())
+
+  @@index([projectId])
+}
+
+// ---------------------------------------------------------------------------
+// KPIs & performance
+// ---------------------------------------------------------------------------
+
+model Kpi {
+  id             String         @id @default(cuid())
+  organisationId String
+  organisation   Organisation   @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  opportunityId  String?
+  opportunity    AIOpportunity? @relation(fields: [opportunityId], references: [id])
+  projectId      String?
+  project        Project?       @relation(fields: [projectId], references: [id])
+
+  name           String
+  metricKey      String // HOURS_SAVED | COST | REVENUE | ACCURACY | RESPONSE_TIME | CSAT | ADOPTION | AI_USAGE | ERROR_RATE | ESCALATION_RATE | CUSTOM
+  unit           String   @default("")
+  direction      String   @default("INCREASE") // INCREASE | DECREASE
+  baselineValue  Float?
+  projectedValue Float?
+  targetValue    Float?
+  cadence        String   @default("MONTHLY")
+  createdAt      DateTime @default(now())
+
+  results KpiResult[]
+
+  @@index([organisationId])
+}
+
+model KpiResult {
+  id           String   @id @default(cuid())
+  kpiId        String
+  kpi          Kpi      @relation(fields: [kpiId], references: [id], onDelete: Cascade)
+  periodStart  DateTime
+  periodEnd    DateTime
+  actualValue  Float
+  note         String?
+  recordedById String?
+  createdAt    DateTime @default(now())
+
+  @@index([kpiId])
+}
+
+model AIImplementation {
+  id             String        @id @default(cuid())
+  organisationId String
+  organisation   Organisation  @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  opportunityId  String        @unique
+  opportunity    AIOpportunity @relation(fields: [opportunityId], references: [id], onDelete: Cascade)
+  name           String
+  technology     String?
+  status         String        @default("LIVE") // LIVE | PILOT | PAUSED | RETIRED
+  goLiveDate     DateTime?
+  oversightModel String?
+  createdAt      DateTime      @default(now())
+
+  reviews AIReview[]
+
+  @@index([organisationId])
+}
+
+model AIReview {
+  id               String            @id @default(cuid())
+  organisationId   String
+  organisation     Organisation      @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  implementationId String?
+  implementation   AIImplementation? @relation(fields: [implementationId], references: [id])
+  periodStart      DateTime
+  periodEnd        DateTime
+  projected        String            @default("{}") // JSON
+  actual           String            @default("{}") // JSON
+  variance         String            @default("{}") // JSON
+  verdict          String            @default("ON_TRACK") // EXCEEDING | ON_TRACK | BELOW | INCONCLUSIVE
+  narrative        String?
+  recommendations  String            @default("[]")
+  createdAt        DateTime          @default(now())
+
+  @@index([organisationId])
+}
+
+/// A periodic "what has changed?" re-analysis of the business (§16).
+model DiscoveryCycle {
+  id                String       @id @default(cuid())
+  organisationId    String
+  organisation      Organisation @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  status            String       @default("OPEN") // OPEN | ANSWERED | ANALYSED
+  changesReported   String?
+  findings          String       @default("[]")
+  newOpportunityIds String       @default("[]")
+  fromVersion       Int?
+  toVersion         Int?
+  createdAt         DateTime     @default(now())
+  completedAt       DateTime?
+
+  @@index([organisationId])
+}
+
+// ---------------------------------------------------------------------------
+// Governance
+// ---------------------------------------------------------------------------
+
+model AuditLog {
+  id             String        @id @default(cuid())
+  organisationId String?
+  organisation   Organisation? @relation(fields: [organisationId], references: [id])
+  userId         String?
+  user           User?         @relation(fields: [userId], references: [id])
+  action         String // e.g. opportunity.approve
+  entityType     String?
+  entityId       String?
+  metadata       String        @default("{}")
+  ipAddress      String?
+  createdAt      DateTime      @default(now())
+
+  @@index([organisationId])
+  @@index([createdAt])
+}
+
+/// Admin-managed AI model configuration (§2 platform administrator).
+model AIModelConfig {
+  id          String   @id @default(cuid())
+  key         String   @unique // analysis | report | interview
+  label       String
+  modelId     String
+  temperature Float    @default(0.2)
+  maxTokens   Int      @default(4096)
+  isActive    Boolean  @default(true)
+  updatedAt   DateTime @updatedAt
+}
+
+/// Records every LLM/engine call for auditability (§19).
+model AIGenerationLog {
+  id             String   @id @default(cuid())
+  organisationId String?
+  agent          String
+  provider       String
+  model          String?
+  task           String
+  inputSummary   String?
+  outputSummary  String?
+  confidence     String?
+  tokensIn       Int?
+  tokensOut      Int?
+  durationMs     Int?
+  status         String   @default("OK")
+  error          String?
+  createdAt      DateTime @default(now())
+
+  @@index([organisationId])
+}
