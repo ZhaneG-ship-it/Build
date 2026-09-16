@@ -12,8 +12,8 @@
     "db:push": "prisma db push",
     "db:generate": "prisma generate",
     "db:seed": "tsx --conditions=react-server prisma/seed.ts",
-    "db:reset": "rm -f prisma/dev.db && prisma db push && npm run db:seed",
-    "setup": "prisma generate && prisma db push && npm run db:seed",
+    "db:reset": "node scripts/ensure-env.mjs && rm -f prisma/dev.db && prisma db push && npm run db:seed",
+    "setup": "node scripts/ensure-env.mjs && prisma generate && prisma db push && npm run db:seed",
     "test": "tsx --conditions=react-server --test tests/*.test.ts"
   },
   "dependencies": {
